@@ -1,9 +1,10 @@
 // LaunchLens: a token launch radar model. One sealed snapshot in, one ranked board out.
 //
 // The board covers every slug in the snapshot's watchlist (the floor, never a ceiling) and adds every
-// other rankable protocol that records no token: the early rows the radar exists to find. Protocols
-// whose token already trades are never ranked; they are measured separately as the live reference set,
-// because their market caps are what teach the model what a launch is worth.
+// other rankable protocol that records no token: the early rows the radar exists to find. Every board
+// row carries token_status "pre-token" so the separation is explicit in the data itself. Protocols
+// whose token already trades are never ranked; they are measured separately as the live reference
+// set, because their market caps are what teach the model what a launch is worth.
 //
 // The value model uses only the snapshot's own figures, and its centre is learned, not hardcoded:
 // for each category, the launch multiple is the MEDIAN market-cap-to-TVL ratio of the protocols in
@@ -12,13 +13,15 @@
 //
 //   implied = TVL x category multiple x growth x maturity x reach x size
 //
-//   growth    from change_7d (per cent), clamped to [-50, 150], weight 0.40, floored at 0.60
-//   maturity  0.75 + 0.45 x min(age_days, 1460) / 1460; a protocol with no listed date scores 0.90
-//   reach     1 + 0.04 per extra chain beyond the first, capped at five extra chains
-//   size      1 up to $2B of TVL, then a gentle (2B / TVL)^0.08 compression, floored at 0.70
+//   growth    a saturating curve on change_7d: 1 + 0.45 x g / (50 + |g|), g clamped to [-90, 400],
+//             so a hot week lifts value without a 4,000% outlier breaking the board
+//   maturity  0.70 + 0.50 x sqrt(min(age_days, 1825) / 1825): years run with no token earn trust
+//             on a square-root curve; a protocol with no listed date scores 0.88
+//   reach     1 + 0.03 per extra chain beyond the first, capped at eight extra chains
+//   size      1 up to $1B of TVL, then a gentle (1B / TVL)^0.10 compression, floored at 0.65
 //
 // No protocol name is ever special-cased: the same functions score every row, and the dashboard
-// states the model and shows each row's arithmetic.
+// states the model and shows each row's arithmetic, factor by factor.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -44,10 +47,10 @@ export interface Snapshot {
 }
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'launchlens-1';
+export const MODEL_VERSION = 'launchlens-2';
 
 /** How many live-token protocols the reference table carries, by market cap. */
-export const LIVE_ROWS = 24;
+export const LIVE_ROWS = 30;
 
 /** One category's learned launch multiple and the traded peers it came from. */
 export interface CategoryMultiple {
@@ -63,6 +66,14 @@ export interface LearnedModel {
   by_category: Map<string, CategoryMultiple>;
 }
 
+/** A farm plan's budget, summed from its own steps so the dashboard can quote it at a glance. */
+export interface FarmBudget {
+  capital_usd: number;
+  est_fees_usd: number;
+  days: number;
+  est_minutes: number;
+}
+
 /** One row of board.json: the ranked board's row. */
 export interface BoardRow {
   rank: number;
@@ -75,6 +86,8 @@ export interface BoardRow {
   listed_at: string | null;
   age_days: number | null;
   on_watchlist: boolean;
+  token_status: 'pre-token';
+  confidence: number;
   implied_value_usd: number;
   model: {
     category_multiple: number;
@@ -84,6 +97,7 @@ export interface BoardRow {
     reach_factor: number;
     size_factor: number;
   };
+  farm: FarmBudget;
   farm_steps: string[];
 }
 
@@ -94,6 +108,7 @@ export interface RadarRow extends BoardRow {}
 export interface LiveRow {
   slug: string;
   name: string;
+  symbol: string | null;
   category: string | null;
   chains: string[];
   tvl_usd: number;
@@ -114,6 +129,9 @@ export interface RadarData {
   board_size: number;
   early_size: number;
   live_size: number;
+  live_total: number;
+  board_tvl_usd: number;
+  median_implied_usd: number;
   rows: RadarRow[];
   live: LiveRow[];
 }
@@ -130,6 +148,10 @@ const DAY_MS = 86_400_000;
 
 function clamp(value: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, value));
+}
+
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
 }
 
 function round4(n: number): number {
@@ -211,6 +233,24 @@ function multipleFor(model: LearnedModel, p: SnapshotProtocol): number {
   return entry === undefined ? model.global_multiple : entry.multiple;
 }
 
+/**
+ * How complete one protocol's own record is, 0 to 100: a reported seven-day change, a listed
+ * date, several chains and a category whose multiple was learned from traded peers all raise it.
+ * Confidence never moves the value; it tells the reader how much record the value rests on.
+ */
+export function confidenceFor(p: SnapshotProtocol, model: LearnedModel): number {
+  let score = 30;
+  if (typeof p.change_7d === 'number' && Number.isFinite(p.change_7d)) score += 25;
+  if (p.listed_at !== null) score += 20;
+  if (p.chains.length >= 3) score += 10;
+  else if (p.chains.length === 2) score += 6;
+  else if (p.chains.length === 1) score += 3;
+  const entry = model.by_category.get(p.category ?? 'Uncategorised');
+  if (entry !== undefined && entry.learned) score += 15;
+  else if (entry !== undefined) score += 7;
+  return Math.min(100, score);
+}
+
 /** The four adjustment factors and the implied value one protocol gets under the learned model. */
 export function impliedValue(
   p: SnapshotProtocol,
@@ -219,11 +259,11 @@ export function impliedValue(
 ): { implied: number; multiple: number; growthPct: number; growthFactor: number; maturityFactor: number; reachFactor: number; sizeFactor: number; age: number | null } {
   const multiple = multipleFor(model, p);
   const age = ageDays(asOf, p.listed_at);
-  const growthPct = clamp(typeof p.change_7d === 'number' && Number.isFinite(p.change_7d) ? p.change_7d : 0, -50, 150);
-  const growthFactor = clamp(1 + (growthPct / 100) * 0.4, 0.6, 1.6);
-  const maturityFactor = age === null ? 0.9 : 0.75 + 0.45 * (Math.min(age, 1460) / 1460);
-  const reachFactor = 1 + 0.04 * Math.min(Math.max(p.chains.length - 1, 0), 5);
-  const sizeFactor = p.tvl_usd > 2_000_000_000 ? Math.max(0.7, Math.pow(2_000_000_000 / p.tvl_usd, 0.08)) : 1;
+  const growthPct = clamp(typeof p.change_7d === 'number' && Number.isFinite(p.change_7d) ? p.change_7d : 0, -90, 400);
+  const growthFactor = clamp(1 + 0.45 * (growthPct / (50 + Math.abs(growthPct))), 0.62, 1.42);
+  const maturityFactor = age === null ? 0.88 : 0.7 + 0.5 * Math.sqrt(Math.min(age, 1825) / 1825);
+  const reachFactor = 1 + 0.03 * Math.min(Math.max(p.chains.length - 1, 0), 8);
+  const sizeFactor = p.tvl_usd > 1_000_000_000 ? Math.max(0.65, Math.pow(1_000_000_000 / p.tvl_usd, 0.1)) : 1;
   const implied = Math.max(1, Math.round(p.tvl_usd * multiple * growthFactor * maturityFactor * reachFactor * sizeFactor));
   return { implied, multiple, growthPct, growthFactor, maturityFactor, reachFactor, sizeFactor, age };
 }
@@ -243,21 +283,37 @@ function chainOf(p: SnapshotProtocol): string {
   return p.chains.length > 0 ? p.chains[0]! : 'its main chain';
 }
 
-/** What one transaction costs on the protocol's first chain, in words a farmer can budget with. */
-function gasWords(chain: string): { core: string; light: string } {
-  if (chain === 'Ethereum') return { core: 'about $12 in mainnet gas', light: '$6' };
-  if (chain === 'Solana') return { core: 'under $0.10 in network fees', light: '$0.10' };
-  if (chain === 'Bitcoin') return { core: 'about $2 in network fees', light: '$1' };
-  return { core: 'about $0.60 in gas', light: '$0.30' };
+/**
+ * What one on-chain action costs on a chain, in US dollars of network fees, from a small
+ * per-chain table a farmer can budget with. Ethereum mainnet is the expensive outlier; most
+ * rollups and alt-L1s clear for cents. Unknown chains get a mid estimate.
+ */
+const CHAIN_FEE_USD: Record<string, number> = {
+  Ethereum: 12, Arbitrum: 0.15, Base: 0.08, Solana: 0.02, Binance: 0.3, Polygon: 0.02,
+  Avalanche: 0.25, Optimism: 0.12, Tron: 1.3, Bitcoin: 2, 'Hyperliquid L1': 0.01, Sui: 0.01,
+  Aptos: 0.01, Near: 0.01, Cosmos: 0.05, Linea: 0.1, Scroll: 0.1, Mantle: 0.05, Starknet: 0.05,
+  zkSync: 0.08, Sonic: 0.01, Berachain: 0.05, Monad: 0.01, TON: 0.05, Cardano: 0.2, Stellar: 0.01,
+};
+
+function feeFor(chain: string): number {
+  return CHAIN_FEE_USD[chain] ?? 0.4;
 }
 
-/** How much capital one farm position needs, from the protocol's own TVL. */
+function feeText(usd: number): string {
+  return usd < 1 ? `$${usd.toFixed(2)}` : `$${usd.toFixed(2).replace(/\.?0+$/, '')}`;
+}
+
+/** How much capital one farm position needs, from the protocol's own TVL and category. */
 function capitalFor(p: SnapshotProtocol): number {
-  if (p.tvl_usd >= 5_000_000_000) return 500;
-  if (p.tvl_usd >= 1_000_000_000) return 300;
-  if (p.tvl_usd >= 250_000_000) return 200;
-  if (p.tvl_usd >= 50_000_000) return 120;
-  return 60;
+  let capital = 60;
+  if (p.tvl_usd >= 5_000_000_000) capital = 500;
+  else if (p.tvl_usd >= 1_000_000_000) capital = 300;
+  else if (p.tvl_usd >= 250_000_000) capital = 200;
+  else if (p.tvl_usd >= 50_000_000) capital = 120;
+  const c = (p.category ?? '').toLowerCase();
+  if (c.includes('rwa')) capital = Math.max(capital, 250);
+  if (c.includes('prediction')) capital = Math.max(capital, 100);
+  return capital;
 }
 
 /** How long to hold, from the protocol's age: younger protocols get a longer qualifying window. */
@@ -275,57 +331,72 @@ const WEEKDAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'];
 function coreAction(p: SnapshotProtocol, capital: number, chain: string): string {
   const c = (p.category ?? '').toLowerCase();
   const n = p.name;
-  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral')) return `Supply $${capital} of USDC as collateral to ${n} on ${chain}, so the wallet holds a live lending position.`;
-  if (c.includes('dex') || c.includes('amm')) return `Add $${capital} of liquidity to ${n}'s busiest stablecoin pool on ${chain} and keep the LP position open.`;
-  if (c.includes('perpetual') || c.includes('derivative') || c.includes('option')) return `Deposit $${capital} of USDC as margin on ${n} and open one small hedged position you can leave running.`;
-  if (c.includes('curator') || c.includes('allocator') || c.includes('vault') || c.includes('yield')) return `Deposit $${capital} into ${n}'s flagship vault on ${chain} and hold the vault shares in the same wallet.`;
-  if (c.includes('staking') || c.includes('restak')) return `Stake $${capital} worth of the network asset through ${n} on ${chain} and keep the staking receipt.`;
-  if (c.includes('bridge') || c.includes('cross')) return `Bridge $${capital} of USDC through ${n} to ${chain} and put the bridged funds to work in its app.`;
-  if (c.includes('stable')) return `Mint or deposit $${capital} of the stable asset through ${n} on ${chain} and hold it in the farming wallet.`;
-  if (c.includes('rwa')) return `Subscribe $${capital} to ${n}'s tokenised asset on ${chain} and hold the position to term.`;
-  if (c.includes('insurance')) return `Buy $${capital} of cover from ${n} on ${chain} and keep the policy active for the full term.`;
-  if (c.includes('prediction')) return `Fund $${capital} on ${n} and take one position in each of two liquid markets.`;
-  if (c.includes('launchpad') || c.includes('ido')) return `Register the wallet on ${n} and complete its participation steps with $${capital} ready to commit.`;
-  return `Deposit $${capital} of USDC into ${n}'s main product on ${chain} and keep the position open.`;
+  if (c.includes('cdp')) return `Deposit $${capital} of ETH or a liquid staking token as collateral in ${n} on ${chain} and mint its stablecoin against it at under 50 per cent loan-to-value.`;
+  if (c.includes('lend') || c.includes('collateral')) return `Supply $${capital} of USDC as collateral to ${n} on ${chain} and borrow about 30 per cent against it, so the wallet holds a live two-sided lending position.`;
+  if (c.includes('dex') || c.includes('amm')) return `Add $${capital} of liquidity to ${n}'s busiest stablecoin pool on ${chain}, split evenly across both assets, and keep the LP position open.`;
+  if (c.includes('perpetual') || c.includes('derivative')) return `Deposit $${capital} of USDC as margin on ${n} and open one small delta-neutral position: long spot, short the same size on the perp.`;
+  if (c.includes('basis')) return `Open the basis trade on ${n} with $${capital}: hold the spot asset and short its perpetual future for the same notional.`;
+  if (c.includes('curator') || c.includes('allocator') || c.includes('vault') || c.includes('yield')) return `Deposit $${capital} into ${n}'s flagship vault on ${chain} and hold the vault shares in the same wallet for the whole plan.`;
+  if (c.includes('staking') || c.includes('restak')) return `Stake $${capital} worth of the network asset through ${n} on ${chain} and keep the staking receipt token in the wallet.`;
+  if (c.includes('bridge') || c.includes('cross')) return `Bridge $${capital} of USDC through ${n} to ${chain} and put the bridged funds to work in a pool on the far side the same day.`;
+  if (c.includes('stable')) return `Mint or deposit $${capital} of the stable asset through ${n} on ${chain} and hold it in the farming wallet, unspent.`;
+  if (c.includes('rwa')) return `Complete ${n}'s KYC check, then subscribe $${capital} to its shortest-term tokenised asset on ${chain} and hold the position to term.`;
+  if (c.includes('insurance')) return `Buy $${capital} of cover from ${n} on ${chain} for a protocol you already use and keep the policy active for the full term.`;
+  if (c.includes('prediction')) return `Fund $${capital} on ${n} and take one position in each of two liquid markets, sized under $${Math.round(capital / 4)} each.`;
+  if (c.includes('launchpad') || c.includes('ido')) return `Register the wallet on ${n}, complete its whitelist or staking step, and keep $${capital} of stablecoins ready to commit.`;
+  if (c.includes('index')) return `Buy $${capital} of ${n}'s main index token on ${chain} and hold it in the farming wallet.`;
+  if (c.includes('leveraged')) return `Open a conservative 2x leveraged farm of $${capital} on ${n}'s main pair on ${chain}, with liquidation at least 40 per cent away.`;
+  if (c.includes('chain')) return `Bridge $${capital} of USDC to ${chain} through ${n}'s canonical route and make it your active wallet on that chain.`;
+  return `Deposit $${capital} of USDC into ${n}'s main product on ${chain} and keep the position open for the whole plan.`;
 }
 
 /** The second qualifying action: a different verb than the core one, so the wallet's history is varied. */
 function secondAction(p: SnapshotProtocol, chain: string): string {
   const c = (p.category ?? '').toLowerCase();
   const n = p.name;
-  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral')) return `Borrow about 30 per cent against the collateral on ${n}, hold the borrowed stablecoin for a week, then repay in full.`;
-  if (c.includes('dex') || c.includes('amm')) return `Route three swaps of $25 or more through ${n}'s own interface on ${chain}, on three different days.`;
-  if (c.includes('perpetual') || c.includes('derivative') || c.includes('option')) return `Close the first hedge and open a second, smaller one, so the account shows two separate trading sessions on ${n}.`;
-  if (c.includes('curator') || c.includes('allocator') || c.includes('vault') || c.includes('yield')) return `Move a quarter of the position into a second ${n} vault, so the wallet holds two distinct vault positions.`;
-  if (c.includes('staking') || c.includes('restak')) return `Claim the staking rewards once and restake them through ${n}, which records a second on-chain action.`;
+  if (c.includes('cdp')) return `Repay a slice of the minted stablecoin and mint again a week later, so ${n} records two separate mint cycles from this wallet.`;
+  if (c.includes('lend') || c.includes('collateral')) return `Repay the borrow in full after seven days, then borrow again at a smaller size, so ${n} records two complete borrow cycles.`;
+  if (c.includes('dex') || c.includes('amm')) return `Route three swaps of $25 or more through ${n}'s own interface on ${chain}, on three different days, keeping the LP untouched.`;
+  if (c.includes('perpetual') || c.includes('derivative') || c.includes('basis')) return `Close the first hedge after a week and reopen it at half size, so the account shows two separate trading sessions on ${n}.`;
+  if (c.includes('curator') || c.includes('allocator') || c.includes('vault') || c.includes('yield')) return `Move a quarter of the position into a second ${n} vault, so the wallet holds two distinct vault positions at once.`;
+  if (c.includes('staking') || c.includes('restak')) return `Claim the staking rewards once and restake them through ${n}, which records a second on-chain action from the same wallet.`;
   if (c.includes('bridge') || c.includes('cross')) return `Bridge a further $40 back through ${n} in the opposite direction, so both routes appear in the wallet's history.`;
+  if (c.includes('rwa')) return `Read ${n}'s term sheet and attestation page from the app and set a calendar note for the position's maturity date.`;
   return `Make one governance or community action ${n} offers, such as a vote or a quest, from the same wallet.`;
 }
 
 /**
- * A protocol's farm plan: seven steps, each concrete about the action, what it costs and how long it
- * takes. The plan is derived from the protocol's own record (category, chains, TVL, age) with a
- * deterministic per-slug variation, never from a hand-written list of names.
+ * A protocol's farm plan: eight steps, each concrete about the action, what it costs and how
+ * long it takes, plus the budget those steps sum to. The plan is derived from the protocol's
+ * own record (category, chains, TVL, age) with a deterministic per-slug variation, never from
+ * a hand-written list of names.
  */
-export function farmSteps(p: SnapshotProtocol, age: number | null): string[] {
+export function farmPlan(p: SnapshotProtocol, age: number | null): { steps: string[]; budget: FarmBudget } {
   const chain = chainOf(p);
-  const gas = gasWords(chain);
+  const fee = feeFor(chain);
+  const light = round2(Math.max(0.01, fee * 0.5));
   const capital = capitalFor(p);
   const hold = holdDaysFor(age);
   const weeks = Math.max(4, Math.round(hold / 7));
   const weekday = WEEKDAYS[slugHash(p.slug) % WEEKDAYS.length]!;
+  const secondChain = p.chains.length > 1 ? p.chains[1]! : null;
+  const weeklyFees = round2(light * weeks);
+  const totalFees = round2(fee * 5 + weeklyFees + light);
+  const totalMinutes = 15 + 25 + 15 + 20 + 10 * weeks + 10 + 15 + 25;
   const steps = [
-    `Open a fresh wallet dedicated to ${p.name} and write its seed phrase on paper, never in a cloud note. Fund it with $${capital} of USDC plus gas money on ${chain}. Cost: ${gas.core} to fund. Time: 15 minutes, once.`,
-    `${coreAction(p, capital, chain)} Cost: the $${capital} position plus ${gas.core}. Time: 20 minutes to set up.`,
-    `${secondAction(p, chain)} Cost: ${gas.core}. Time: 15 minutes, in the first week.`,
-    `Repeat one small qualifying action every ${weekday} for ${hold} days: a top-up, a swap or a claim keeps the wallet visible in ${p.name}'s activity snapshots. Cost: about ${gas.light} a week in gas. Time: 10 minutes a week for ${weeks} weeks.`,
-    `After each session, log the date, the action and the transaction hash in a farm diary, and check ${p.name}'s own app for a points, XP or season page. Cost: nothing. Time: 5 minutes after each session.`,
-    p.chains.length > 1
-      ? `In week three, extend the farm to ${p.chains[1]!}: bridge $40 through ${p.name}'s own route and repeat the core action there, so the wallet qualifies on two chains. Cost: ${gas.core} plus bridge fees. Time: 25 minutes, once.`
-      : `In week three, deepen the position by a quarter (about $${Math.round(capital / 4)}) and repeat the second action, so the wallet's history is not a single deposit. Cost: the added capital plus ${gas.core}. Time: 15 minutes, once.`,
-    `From day ${hold} on, review the position every week. If ${p.name} announces a token, claim only through the link in its official app and never pay a fee to claim. Cost: ${gas.core} to unwind. Time: 20 minutes to exit in full.`,
+    `Set up one fresh wallet dedicated to ${p.name}; write the seed phrase on paper, never in a cloud note. Fund it with $${capital} of USDC plus fee money on ${chain}. Cost: ${feeText(fee)} network fee to fund. Time: 15 minutes, once, on day 1.`,
+    `${coreAction(p, capital, chain)} Cost: the $${capital} position plus ${feeText(fee)} in fees. Time: 25 minutes to open, on day 1.`,
+    `${secondAction(p, chain)} Cost: ${feeText(fee)} in fees. Time: 15 minutes, inside the first week.`,
+    secondChain !== null
+      ? `In week 3, extend the farm to ${secondChain}: bridge $40 through ${p.name}'s own route and repeat a small version of the core action there, so the wallet qualifies on two chains. Cost: ${feeText(fee)} plus bridge fees of about $1. Time: 25 minutes, once.`
+      : `In week 3, deepen the position by a quarter (about $${Math.round(capital / 4)}) and repeat the second action, so the wallet's history is not a single deposit. Cost: the added capital plus ${feeText(fee)} in fees. Time: 15 minutes, once.`,
+    `Every ${weekday} for ${hold} days, repeat one small qualifying action: a $10 top-up, a swap or a reward claim keeps the wallet visible in ${p.name}'s activity snapshots. Cost: about ${feeText(light)} a week, ${feeText(weeklyFees)} in all. Time: 10 minutes a week for ${weeks} weeks.`,
+    `Once a month, open ${p.name}'s own app and check for a points, XP or season page; screenshot the wallet's standing and log the date, action and transaction hash of every session in a farm diary. Cost: ${feeText(light)} if a claim is needed, otherwise nothing. Time: 10 minutes a month.`,
+    `Halfway through, at day ${Math.round(hold / 2)}, review the position: check ${p.name}'s TVL trend in its app, confirm the position still qualifies, and rebalance only if the pool or vault changed. Cost: ${feeText(fee)} if you rebalance, otherwise nothing. Time: 15 minutes, once.`,
+    `From day ${hold} on, review weekly and exit in full when you decide to stop: withdraw, swap back to USDC and bridge home if needed. If ${p.name} announces a token, claim only through the link inside its official app and never pay a third party a fee to claim. Cost: ${feeText(fee)} to unwind. Time: 25 minutes to exit. Whole plan: $${capital} of capital, about ${feeText(totalFees)} of fees, ${hold} days, roughly ${(totalMinutes / 60).toFixed(1)} hours hands-on.`,
   ];
-  return steps.map((s) => (s.length > 600 ? `${s.slice(0, 596)}...` : s));
+  const budget: FarmBudget = { capital_usd: capital, est_fees_usd: totalFees, days: hold, est_minutes: totalMinutes };
+  return { steps: steps.map((s) => (s.length > 600 ? `${s.slice(0, 596)}...` : s)), budget };
 }
 
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
@@ -342,28 +413,34 @@ export function buildBoard(snapshot: Snapshot, model: LearnedModel): BoardRow[] 
   const watchlist = new Set(snapshot.watchlist);
   const scored = [...chosen.values()].map((p) => ({ p, v: impliedValue(p, snapshot.as_of, model) }));
   scored.sort((a, b) => b.v.implied - a.v.implied || b.p.tvl_usd - a.p.tvl_usd || (a.p.slug < b.p.slug ? -1 : 1));
-  return scored.map((s, i) => ({
-    rank: i + 1,
-    slug: s.p.slug,
-    name: s.p.name,
-    category: s.p.category,
-    chains: s.p.chains,
-    tvl_usd: s.p.tvl_usd,
-    change_7d: s.p.change_7d,
-    listed_at: s.p.listed_at,
-    age_days: s.v.age,
-    on_watchlist: watchlist.has(s.p.slug),
-    implied_value_usd: s.v.implied,
-    model: {
-      category_multiple: round4(s.v.multiple),
-      growth_pct: round4(s.v.growthPct),
-      growth_factor: round4(s.v.growthFactor),
-      maturity_factor: round4(s.v.maturityFactor),
-      reach_factor: round4(s.v.reachFactor),
-      size_factor: round4(s.v.sizeFactor),
-    },
-    farm_steps: farmSteps(s.p, s.v.age),
-  }));
+  return scored.map((s, i) => {
+    const plan = farmPlan(s.p, s.v.age);
+    return {
+      rank: i + 1,
+      slug: s.p.slug,
+      name: s.p.name,
+      category: s.p.category,
+      chains: s.p.chains,
+      tvl_usd: s.p.tvl_usd,
+      change_7d: s.p.change_7d,
+      listed_at: s.p.listed_at,
+      age_days: s.v.age,
+      on_watchlist: watchlist.has(s.p.slug),
+      token_status: 'pre-token' as const,
+      confidence: confidenceFor(s.p, model),
+      implied_value_usd: s.v.implied,
+      model: {
+        category_multiple: round4(s.v.multiple),
+        growth_pct: round4(s.v.growthPct),
+        growth_factor: round4(s.v.growthFactor),
+        maturity_factor: round4(s.v.maturityFactor),
+        reach_factor: round4(s.v.reachFactor),
+        size_factor: round4(s.v.sizeFactor),
+      },
+      farm: plan.budget,
+      farm_steps: plan.steps,
+    };
+  });
 }
 
 /** The live-token protocols, by market cap, for the dashboard's reference table. */
@@ -375,6 +452,7 @@ export function liveRows(snapshot: Snapshot): LiveRow[] {
     .map((p) => ({
       slug: p.slug,
       name: p.name,
+      symbol: p.symbol,
       category: p.category,
       chains: p.chains,
       tvl_usd: p.tvl_usd,
@@ -389,8 +467,10 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
   const model = learnModel(snapshot);
   const board = buildBoard(snapshot, model);
   const live = liveRows(snapshot);
+  const liveTotal = snapshot.protocols.filter((p) => !isPreToken(p)).length;
   const early = board.filter((r) => !r.on_watchlist).length;
   const categoryMultiples = [...model.by_category.values()].sort((a, b) => (a.category < b.category ? -1 : 1));
+  const impliedSorted = board.map((r) => r.implied_value_usd).sort((a, b) => a - b);
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -402,6 +482,9 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     board_size: board.length,
     early_size: early,
     live_size: live.length,
+    live_total: liveTotal,
+    board_tvl_usd: board.reduce((sum, r) => sum + r.tvl_usd, 0),
+    median_implied_usd: impliedSorted.length > 0 ? impliedSorted[Math.floor(impliedSorted.length / 2)]! : 0,
     rows: board,
     live,
   };

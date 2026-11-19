@@ -10,8 +10,13 @@
 <a class="skip" href="#board">Skip to the board</a>
 <header class="mast">
   <div class="mast-in">
-    <div class="brand"><span class="blip"></span>LaunchLens</div>
-    <p class="tag">Token launch radar: pre-token protocols ranked by implied launch value, each with a farm plan.</p>
+    <div class="brandrow">
+      <div class="brand"><span class="blip"></span>LaunchLens</div>
+      <div class="brandsub">TOKEN LAUNCH RADAR</div>
+    </div>
+    <p class="tag">Every protocol that <b>records no token yet</b>, ranked by what its launch would be worth if its record stayed as the snapshot has it — each with a costed farm plan. Protocols whose token already trades are kept off the board, in the reference set below.</p>
+    <div class="stats" id="stats"></div>
+    <p class="modelstrip">Model <b id="mver">launchlens-2</b> &nbsp;·&nbsp; <code>implied = TVL × category multiple × growth × maturity × reach × size</code> &nbsp;·&nbsp; the multiple is the <b>median market-cap / TVL of the same category's already-trading protocols</b> in this snapshot — learned from the data, never a list of names.</p>
     <p class="meta" id="meta">Loading the snapshot…</p>
   </div>
 </header>
