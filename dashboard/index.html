@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LaunchLens — Token Launch Radar</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand"><span class="lens"></span><div><h1>LaunchLens</h1><p>Token launch radar — pre-token protocols ranked by implied launch value</p></div></div>
+  <div class="stats" id="stats"></div>
+</header>
+<section class="model" id="model"></section>
+<nav class="controls">
+  <input id="q" type="search" placeholder="Search name or slug">
+  <select id="cat"><option value="">All categories</option></select>
+  <select id="chain"><option value="">All chains</option></select>
+  <select id="sort">
+    <option value="rank">Sort: implied value</option>
+    <option value="tvl">Sort: TVL</option>
+    <option value="growth">Sort: 7d growth</option>
+    <option value="age">Sort: track record</option>
+  </select>
+  <div class="tabs">
+    <button id="tab-pre" class="tab on">Pre-token board</button>
+    <button id="tab-live" class="tab">Already trading</button>
+  </div>
+</nav>
+<main class="layout">
+  <section class="boardwrap"><table id="board"><thead></thead><tbody></tbody></table><p id="empty" class="empty" hidden>No protocols match this filter.</p></section>
+  <aside id="detail" class="detail"></aside>
+</main>
+<footer>LaunchLens-3 model: a robust regression fitted to this snapshot's own already-trading protocols — value against log TVL with a size exponent under 1, ridge-shrunk category offsets, and fitted growth and track-record terms — cross-validated against a category-multiple model on the same protocols, with the errors stated in the panel above. A protocol listed here records no token in the snapshot — that is DefiLlama's record, not proof it has none. Implied value is this radar's own claim.</footer>
+<script src="../data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
